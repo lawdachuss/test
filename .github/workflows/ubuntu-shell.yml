@@ -12,7 +12,7 @@ jobs:
       - name: Setup Ubuntu with tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl git python3 python3-pip fastfetch neofetch
+          sudo apt-get install -y wget curl git python3 python3-pip
 
       - name: Start SSH session
         uses: mxschmitt/action-tmate@v3
