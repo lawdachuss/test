@@ -1,0 +1,18 @@
+name: Ubuntu Shell
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Ubuntu with tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl git python3 python3-pip fastfetch neofetch
+
+      - name: Start SSH session
+        uses: mxschmitt/action-tmate@v3
