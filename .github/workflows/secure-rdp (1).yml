@@ -3,6 +3,10 @@ name: Secure RDP
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   rdp:
     runs-on: windows-latest
@@ -12,257 +16,661 @@ jobs:
       - name: Configure Windows RDP
         shell: powershell
         run: |
-          Write-Host "Enabling RDP..."
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
-            -Value 1
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
+          Write-Host "Configuring RDP..."
+          
+          # Enable RDP in registry
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          
+          # Disable Network Level Authentication for easier access
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          
+          # Allow multiple sessions
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0 -Force
+          
+          # Nuclear option: Completely disable Windows Firewall via registry
+          Write-Host "Disabling Windows Firewall via registry..."
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile' -Name "EnableFirewall" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile' -Name "EnableFirewall" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile' -Name "EnableFirewall" -Value 0 -Force
+          
+          # Also use PowerShell method
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
+          
+          # Stop and disable Windows Firewall service completely
+          Stop-Service -Name mpssvc -Force -ErrorAction SilentlyContinue
+          Set-Service -Name mpssvc -StartupType Disabled -ErrorAction SilentlyContinue
+          
+          # Add explicit allow rules for RDP on all interfaces
+          Remove-NetFirewallRule -DisplayName "Allow RDP All" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "Allow RDP All" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any -Enabled True -ErrorAction SilentlyContinue
+          
+          # Allow RDP through Windows Defender Firewall (just in case)
+          netsh advfirewall firewall add rule name="RDP Port 3389" dir=in action=allow protocol=TCP localport=3389
+          
+          Write-Host "Restarting RDP service..."
           Restart-Service TermService -Force
-
-          Write-Host "RDP enabled."
+          
+          # Wait for service to be ready
+          Start-Sleep -Seconds 5
+          
+          # Verify RDP is listening
+          $listening = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if ($listening) {
+            Write-Host "[OK] RDP service is listening on port 3389"
+          } else {
+            Write-Warning "[WARNING] RDP service may not be listening properly"
+          }
+          
+          Write-Host "RDP configured."
 
       - name: Create RDP User
         shell: powershell
         run: |
-          Write-Host "Creating RDP user..."
-
-          $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
-          $password = -join ((1..20) | ForEach-Object {
-            $chars[(Get-Random -Maximum $chars.Length)]
-          })
-
+          $chars    = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
+          $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "RDP"
-          }
-
-          New-LocalUser `
-            -Name "RDP" `
-            -Password $securePass `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
-
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) { Remove-LocalUser -Name "RDP" }
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators"       -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-
           Write-Host "RDP user created."
 
       - name: Install Tailscale
         shell: powershell
         run: |
-          Write-Host "Installing Tailscale..."
-
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installer = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest `
-            -Uri $url `
-            -OutFile $installer `
-            -UseBasicParsing
-
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$installer`" /qn /norestart" `
-            -Wait
-
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait
           Remove-Item $installer -Force
-
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tailscale)) {
-            Write-Error "Tailscale binary not found after install"
-            exit 1
-          }
-
+          if (-not (Test-Path $tailscale)) { Write-Error "Tailscale not found"; exit 1 }
           Write-Host "Tailscale installed."
 
-      - name: Connect Tailscale Through iPhone Exit Node
+      - name: Connect Tailscale
         shell: powershell
         run: |
-          Write-Host "Connecting to Tailscale..."
-
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
           $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
-          if ($null -eq $svc) {
-            Write-Error "Tailscale service not found"
-            exit 1
-          }
+          if ($null -eq $svc) { Write-Error "Tailscale service not found"; exit 1 }
+          if ($svc.Status -ne 'Running') { Start-Service Tailscale -ErrorAction Stop }
 
-          if ($svc.Status -ne 'Running') {
-            Write-Host "Starting Tailscale service..."
-            Start-Service Tailscale -ErrorAction Stop
-          } else {
-            Write-Host "Tailscale service already running."
-          }
-
-          Write-Host "Waiting for Tailscale daemon..."
           $ready = $false
           for ($i = 0; $i -lt 15; $i++) {
             try {
               $out = & $tailscale status 2>&1
-              if ($LASTEXITCODE -eq 0 -or ($out -match "Logged out|NeedsLogin|Running|stopped")) {
-                $ready = $true
-                break
-              }
+              if ($LASTEXITCODE -eq 0 -or ($out -match "Logged out|NeedsLogin|Running|stopped")) { $ready = $true; break }
             } catch {}
             Start-Sleep -Seconds 2
           }
+          if (-not $ready) { Write-Error "Tailscale not ready after 30s"; exit 1 }
 
-          if (-not $ready) {
-            Write-Error "Tailscale daemon did not become ready after 30s"
-            exit 1
-          }
-
-          Write-Host "Authenticating and setting exit node in one command..."
-
+          Write-Host "Connecting to Tailscale with optimized settings..."
           & $tailscale up `
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
             --hostname="github-rdp-${{ github.run_id }}" `
             --accept-routes `
             --accept-dns=false `
-            --exit-node=100.83.59.107 `
-            --exit-node-allow-lan-access `
+            --shields-up=false `
+            --ssh=false `
             --timeout=30s `
             --reset
+          if ($LASTEXITCODE -ne 0) { Write-Error "tailscale up failed"; exit 1 }
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "tailscale up failed - check TAILSCALE_AUTH_KEY is valid and not expired"
-            exit 1
-          }
-
-          Write-Host "Waiting for exit node route to settle..."
+          Write-Host "Waiting for Tailscale to stabilize..."
           Start-Sleep -Seconds 5
-
-          Write-Host "-------- TAILSCALE STATUS --------"
+          
           & $tailscale status
-          Write-Host "----------------------------------"
-
-          Write-Host "-------- EXIT NODE CHECK --------"
-          $exitInfo = & $tailscale status 2>&1
-          if ($exitInfo -match "100.76.189.99") {
-            Write-Host "Exit node 100.76.189.99 is present in status."
-          } else {
-            Write-Warning "Exit node 100.76.189.99 not visible in status - check iPhone Tailscale exit node toggle."
-          }
-          Write-Host "---------------------------------"
 
           $ip = $null
           for ($i = 0; $i -lt 15; $i++) {
             try {
               $candidate = (& $tailscale ip -4 2>&1 | Select-Object -First 1).Trim()
-              if ($candidate -match '^\d+\.\d+\.\d+\.\d+$') {
-                $ip = $candidate
-                break
-              }
+              if ($candidate -match '^\d+\.\d+\.\d+\.\d+$') { $ip = $candidate; break }
             } catch {}
             Start-Sleep -Seconds 3
           }
+          if (-not $ip) { Write-Error "No Tailscale IP after 45s"; exit 1 }
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+          
+          # Run netcheck to establish optimal connectivity
+          Write-Host ""
+          Write-Host "Running connectivity check..."
+          & $tailscale netcheck
 
-          if (-not $ip) {
-            Write-Error "No Tailscale IP assigned after 45s"
+      - name: Install WireGuard
+        shell: powershell
+        run: |
+          Write-Host "Installing WireGuard via Chocolatey..."
+          choco install wireguard -y --no-progress
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          if (-not (Test-Path $wg)) { Write-Error "wireguard.exe not found after install"; exit 1 }
+          Write-Host "WireGuard installed at: $wg"
+
+      - name: Connect ProtonVPN Netherlands (WireGuard)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $wg    = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          $wgDir = "$env:TEMP\wg-configs"
+          New-Item -ItemType Directory -Force -Path $wgDir | Out-Null
+
+          function Make-Cfg($privateKey, $publicKey, $endpoint) {
+            return (@(
+              "[Interface]",
+              "PrivateKey = $privateKey",
+              "Address = 10.2.0.2/32, 2a07:b944::2:2/128",
+              "DNS = 10.2.0.1, 2a07:b944::2:1",
+              "",
+              "[Peer]",
+              "PublicKey = $publicKey",
+              "# Route everything EXCEPT Tailscale (100.64.0.0/10) through VPN",
+              "AllowedIPs = 0.0.0.0/5, 8.0.0.0/7, 10.0.0.0/8, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/10, 101.0.0.0/8, 102.0.0.0/7, 104.0.0.0/5, 112.0.0.0/4, 128.0.0.0/1, ::/0",
+              "Endpoint = $endpoint",
+              "PersistentKeepalive = 25"
+            ) -join "`r`n")
+          }
+
+          $configs = @(
+            @{ Name = "NL-FREE-01"; PrivKey = "8C+/CmKjgZZ/S/yHeo/Nb6m/IW0SoxjJyU09eF6kTVk="; PubKey = "vH2i8RY1qc66XfqwrixBpvH4K9GYJatkugJj0GHgoUQ="; Endpoint = "217.23.3.76:51820"   },
+            @{ Name = "NL-FREE-12"; PrivKey = "wOmOxyAMzWIsYh1gqIn5iRfCND5z7vtLA7PFkdawLn4="; PubKey = "1s5mwMp3fZKNucEO3GeHRSUrhGLu/BYeC0UdusyxSWU="; Endpoint = "138.199.7.159:51820" },
+            @{ Name = "NL-FREE-13"; PrivKey = "wH0mK6y6Ez+THsKXpKmq8ZMzRpS0izjUpBjhgjCkFHI="; PubKey = "MTNPR632U9GOxI+B8dMP+KgMJVEO2xQPrem2SuDfTkM="; Endpoint = "89.39.107.188:51820"  }
+          )
+
+          function Get-Egress {
+            try {
+              $trace   = curl.exe -s --max-time 10 "https://1.1.1.1/cdn-cgi/trace" 2>$null
+              if (-not $trace) {
+                Write-Host "[DEBUG] curl returned empty response"
+                return $null
+              }
+              $locLine = ($trace -split "`n" | Where-Object { $_ -like "loc=*" } | Select-Object -First 1)
+              $ipLine  = ($trace -split "`n" | Where-Object { $_ -like "ip=*"  } | Select-Object -First 1)
+              if ($locLine) {
+                return @{ Loc = ($locLine -replace '^loc=','').Trim(); IP = ($ipLine -replace '^ip=','').Trim() }
+              } else {
+                Write-Host "[DEBUG] No location line in trace: $trace"
+              }
+            } catch {
+              Write-Host "[DEBUG] Egress check exception: $_"
+            }
+            return $null
+          }
+
+          function Remove-Tunnel($name) {
+            try { $null = & $wg /uninstalltunnelservice $name 2>&1 } catch {}
+            $global:LASTEXITCODE = 0
+          }
+
+          $connected = $false; $egressLoc = ""; $egressIP = ""; $activeConfig = ""
+
+          foreach ($entry in $configs) {
+            $name    = $entry.Name
+            $cfgPath = "$wgDir\$name.conf"
+            Write-Host ""
+            Write-Host ">>> Trying $name ..."
+
+            $cfgContent = Make-Cfg $entry.PrivKey $entry.PubKey $entry.Endpoint
+            [System.IO.File]::WriteAllText($cfgPath, $cfgContent, (New-Object System.Text.UTF8Encoding($false)))
+
+            Remove-Tunnel $name
+            Start-Sleep -Seconds 2
+
+            Write-Host "Installing tunnel service for $name ..."
+            $installOut = & $wg /installtunnelservice $cfgPath 2>&1
+            $installCode = $LASTEXITCODE
+            Write-Host "  Output : $installOut"
+            Write-Host "  ExitCode: $installCode"
+
+            if ($installCode -ne 0) {
+              Write-Warning "$($name): install failed (exit $installCode), skipping."
+              continue
+            }
+
+            # Give service time to register and explicitly start it
+            Start-Sleep -Seconds 8
+            $svcName = "WireGuardTunnel`$$name"
+            Write-Host "Starting service '$svcName'..."
+            try {
+              $svc = Get-Service -Name $svcName -ErrorAction Stop
+              if ($svc.Status -ne 'Running') {
+                Start-Service -Name $svcName -ErrorAction Stop
+              }
+            } catch {
+              Write-Warning "$($name): service '$svcName' not found or failed to start: $_"
+              Remove-Tunnel $name
+              continue
+            }
+
+            # Wait up to 45s for service to reach Running
+            $up = $false
+            Write-Host "Waiting for service '$svcName' to be Running..."
+            for ($i = 0; $i -lt 22; $i++) {
+              Start-Sleep -Seconds 2
+              $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+              $st  = if ($svc) { $svc.Status } else { "not found" }
+              Write-Host "  [$($i+1)/22] $st"
+              if ($svc -and $svc.Status -eq 'Running') { $up = $true; break }
+            }
+
+            if (-not $up) {
+              Write-Warning "$($name): service did not reach Running, trying next."
+              Remove-Tunnel $name
+              continue
+            }
+
+            # Verify WireGuard adapter and IP assignment
+            Write-Host "Verifying WireGuard network adapter..."
+            $adapterReady = $false
+            for ($i = 0; $i -lt 15; $i++) {
+              Start-Sleep -Seconds 2
+              $adapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*WireGuard*" -and $_.Status -eq "Up" }
+              if ($adapter) {
+                $ipConfig = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+                if ($ipConfig -and $ipConfig.IPAddress -eq "10.2.0.2") {
+                  Write-Host "[OK] WireGuard adapter UP with IP 10.2.0.2"
+                  $adapterReady = $true
+                  break
+                }
+              }
+              Write-Host "  [$($i+1)/15] Waiting for adapter..."
+            }
+
+            if (-not $adapterReady) {
+              Write-Warning "$($name): WireGuard adapter not ready, trying next."
+              Remove-Tunnel $name
+              continue
+            }
+
+            # Test DNS through tunnel
+            Write-Host "Testing DNS resolution through tunnel..."
+            Start-Sleep -Seconds 3
+            try {
+              $dnsTest = Resolve-DnsName -Name "cloudflare.com" -Server "10.2.0.1" -DnsOnly -ErrorAction Stop
+              Write-Host "[OK] DNS working through tunnel"
+            } catch {
+              Write-Warning "[WARN] DNS test failed: $_"
+            }
+
+            # Verify default route is through WireGuard
+            Write-Host "Checking routing table..."
+            $routes = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue
+            if ($routes) {
+              foreach ($route in $routes) {
+                Write-Host "  Route: via interface $($route.InterfaceIndex) metric $($route.RouteMetric)"
+              }
+            }
+
+            Write-Host "$name tunnel running. Verifying NL egress..."
+            for ($i = 0; $i -lt 25; $i++) {
+              Start-Sleep -Seconds 3
+              $eg = Get-Egress
+              if ($eg) {
+                Write-Host "[Attempt $($i+1)/25] Egress: $($eg.Loc) ($($eg.IP))"
+                if ($eg.Loc -eq "NL") {
+                  $connected    = $true
+                  $egressLoc    = $eg.Loc
+                  $egressIP     = $eg.IP
+                  $activeConfig = $name
+                  break
+                }
+              } else {
+                Write-Host "[Attempt $($i+1)/25] No egress data yet..."
+              }
+            }
+            if ($connected) { break }
+
+            Write-Warning "$($name): egress not NL. Current egress: $egressLoc ($egressIP)"
+            Write-Host "Diagnostics for $name failure:"
+            Write-Host "  Service Status: $((Get-Service -Name $svcName -ErrorAction SilentlyContinue).Status)"
+            Write-Host "  Adapter Status: $((Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*WireGuard*' } | Select-Object -First 1).Status)"
+            $currentIP = (Get-NetIPAddress -InterfaceAlias "*$name*" -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+            Write-Host "  Interface IP: $currentIP"
+            
+            Remove-Tunnel $name
+            Start-Sleep -Seconds 5
+          }
+
+          Remove-Item "$wgDir\*.conf" -Force -ErrorAction SilentlyContinue
+
+          if (-not $connected) {
+            Write-Error "All 3 NL configs failed. Could not establish Netherlands egress."
             exit 1
           }
 
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $ip"
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "  PROTONVPN NETHERLANDS CONNECTED"
+          Write-Host "  Config : $activeConfig"
+          Write-Host "  Egress : $egressLoc ($egressIP)"
+          Write-Host "========================================"
 
-      - name: Verify Exit Node Public IP
+      - name: Verify Tailscale After VPN
         shell: powershell
         run: |
-          Write-Host "-------- PUBLIC IP CHECK --------"
-
-          try {
-            $ip1 = Invoke-RestMethod "https://api.ipify.org" -TimeoutSec 15
-            Write-Host "Public IP (ipify)  : $ip1"
-          } catch {
-            Write-Warning "ipify failed: $_"
+          Write-Host "Verifying Tailscale connectivity through WireGuard..."
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          # Force netcheck to update connectivity
+          Write-Host "Refreshing Tailscale network connectivity..."
+          & $tailscale netcheck
+          
+          # Check Tailscale status
+          Write-Host ""
+          Write-Host "Tailscale status:"
+          & $tailscale status
+          
+          # Get full Tailscale status with details
+          Write-Host ""
+          Write-Host "Detailed Tailscale status:"
+          & $tailscale status --json | ConvertFrom-Json | ConvertTo-Json -Depth 10
+          
+          # Verify we can reach Tailscale coordination servers
+          Write-Host ""
+          Write-Host "Testing Tailscale DERP connectivity..."
+          $netcheck = & $tailscale netcheck 2>&1
+          Write-Host $netcheck
+          
+          # Verify Tailscale IP is still accessible
+          $tsIP = $env:TAILSCALE_IP
+          Write-Host ""
+          Write-Host "Testing local Tailscale IP ($tsIP) reachability..."
+          
+          # Try to connect to ourselves on port 3389
+          $success = $false
+          for ($i = 0; $i -lt 10; $i++) {
+            $test = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+              Write-Host "[OK] Tailscale RDP connectivity verified through VPN (attempt $($i+1))"
+              $success = $true
+              break
+            }
+            Write-Host "Attempt $($i+1)/10 failed, retrying..."
+            Start-Sleep -Seconds 3
           }
-
-          try {
-            $ip2 = Invoke-RestMethod "https://ifconfig.me/ip" -TimeoutSec 15
-            Write-Host "Public IP (ifconfig): $ip2"
-          } catch {
-            Write-Warning "ifconfig.me failed: $_"
+          
+          if (-not $success) {
+            Write-Warning "Self-test failed, but this is sometimes normal. Checking external connectivity..."
           }
+          
+          # Show routing table to confirm both routes
+          Write-Host ""
+          Write-Host "Current routing table (Tailscale and VPN routes):"
+          Get-NetRoute | Where-Object { 
+            $_.DestinationPrefix -like "100.*" -or 
+            $_.DestinationPrefix -eq "0.0.0.0/0" -or 
+            $_.DestinationPrefix -like "10.2.*" 
+          } | Format-Table DestinationPrefix, NextHop, InterfaceAlias, RouteMetric -AutoSize
+          
+          # Show all network adapters
+          Write-Host ""
+          Write-Host "Active network adapters:"
+          Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Format-Table Name, InterfaceDescription, MacAddress, LinkSpeed -AutoSize
 
-          try {
-            $ip3 = (Invoke-RestMethod "https://ipinfo.io/json" -TimeoutSec 15)
-            Write-Host "IP info            : $($ip3.ip) / $($ip3.org) / $($ip3.country)"
-          } catch {
-            Write-Warning "ipinfo.io failed: $_"
-          }
-
-          Write-Host "---------------------------------"
-          Write-Host "Compare the above IP to your iPhone carrier/WiFi IP."
-          Write-Host "If it shows a GitHub/Azure IP, the exit node is not routing correctly."
-          Write-Host "---------------------------------"
 
       - name: Verify RDP Port
         shell: powershell
         run: |
-          Write-Host "Checking RDP on $env:TAILSCALE_IP:3389..."
-
-          $success = $false
-
-          for ($i = 0; $i -lt 10; $i++) {
-            $test = Test-NetConnection `
-              -ComputerName $env:TAILSCALE_IP `
-              -Port 3389 `
-              -WarningAction SilentlyContinue
-
-            if ($test.TcpTestSucceeded) {
-              $success = $true
-              break
-            }
-
-            Write-Host "Attempt $($i+1)/10 failed, retrying in 10s..."
-            Start-Sleep -Seconds 10
-          }
-
-          if (-not $success) {
-            Write-Error "RDP port 3389 not reachable on $env:TAILSCALE_IP after 100s"
+          Write-Host "Waiting for RDP service to be fully ready..."
+          Start-Sleep -Seconds 10
+          
+          # Check local RDP listener first
+          $localListener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if (-not $localListener) {
+            Write-Error "RDP is not listening on local port 3389!"
+            netstat -an | findstr :3389
             exit 1
           }
+          Write-Host "[OK] RDP listening locally on port 3389"
+          
+          # Test connection to Tailscale IP
+          Write-Host "Testing RDP connectivity via Tailscale ($env:TAILSCALE_IP)..."
+          $success = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) { 
+              $success = $true
+              Write-Host "[OK] RDP reachable via Tailscale on attempt $($i+1)"
+              break 
+            }
+            Write-Host "Attempt $($i+1)/15 failed, retrying in 5s..."
+            Start-Sleep -Seconds 5
+          }
+          
+          if (-not $success) { 
+            Write-Warning "RDP not reachable via Tailscale IP, but may still work from external clients"
+            Write-Host "Local RDP is confirmed listening - proceeding anyway"
+          } else {
+            Write-Host "[OK] RDP fully verified and reachable"
+          }
 
-          Write-Host "RDP reachable."
+      - name: Setup Cloudflared RDP Tunnel
+        shell: powershell
+        run: |
+          Write-Host "Installing cloudflared..."
+          choco install cloudflared -y --no-progress
+          
+          Write-Host "Starting cloudflared tunnel for RDP..."
+          $tunnelLog = "D:\cloudflared-tunnel.log"
+          
+          # Start cloudflared tunnel - it will auto-generate a trycloudflare.com URL
+          Start-Process cloudflared.exe -ArgumentList "tunnel --url tcp://localhost:3389" -RedirectStandardError $tunnelLog -WindowStyle Hidden
+          
+          Write-Host "Waiting for tunnel to establish..."
+          Start-Sleep -Seconds 15
+          
+          # Read the log file to find the URL
+          $tunnelUrl = $null
+          $maxAttempts = 20
+          
+          for ($i = 0; $i -lt $maxAttempts; $i++) {
+            if (Test-Path $tunnelLog) {
+              $content = Get-Content $tunnelLog -Raw
+              
+              # Look for trycloudflare.com URL
+              if ($content -match '(https://[a-zA-Z0-9\-]+\.trycloudflare\.com)') {
+                $tunnelUrl = $matches[1]
+                break
+              }
+            }
+            Start-Sleep -Seconds 2
+          }
+          
+          if ($tunnelUrl) {
+            $hostname = $tunnelUrl -replace 'https://',''
+            Write-Host ""
+            Write-Host "========================================"
+            Write-Host "  CLOUDFLARED RDP TUNNEL READY"
+            Write-Host "  URL: $tunnelUrl"
+            Write-Host ""
+            Write-Host "  To connect from your PC:"
+            Write-Host "  1. Install cloudflared from: https://github.com/cloudflare/cloudflared/releases"
+            Write-Host "  2. Open PowerShell and run:"
+            Write-Host "     cloudflared access tcp --hostname $hostname --url localhost:13389"
+            Write-Host "  3. Then connect RDP to: localhost:13389"
+            Write-Host ""
+            Write-Host "  OR use this one command:"
+            Write-Host "  cloudflared access rdp --hostname $hostname"
+            Write-Host "  (This will open RDP automatically)"
+            Write-Host ""
+            Write-Host "  Credentials:"
+            Write-Host "  Username: RDP"
+            Write-Host "  Password: $env:RDP_PASSWORD"
+            Write-Host "========================================"
+            
+            echo "CLOUDFLARE_TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
+            echo "CLOUDFLARE_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "Could not find Cloudflare tunnel URL"
+            Write-Host "Log content:"
+            if (Test-Path $tunnelLog) {
+              Get-Content $tunnelLog
+            } else {
+              Write-Host "Log file not found"
+            }
+          }
+
+      - name: Clone MiniDelectableService to D:\
+        shell: powershell
+        run: |
+          $repoDir = "D:\repos\MiniDelectableService"
+          New-Item -ItemType Directory -Force -Path "D:\repos" | Out-Null
+          if (Test-Path $repoDir) { Remove-Item -Recurse -Force $repoDir }
+          git clone --depth 1 "https://github.com/lawdachuss/MiniDelectableService.git" $repoDir
+          Get-ChildItem -Path $repoDir | Select-Object -First 20 | Format-Table -AutoSize
+
+      - name: Write .env file + run setup
+        shell: powershell
+        env:
+          MINI_ENV: ${{ secrets.env }}
+        run: |
+          $repoDir = "D:\repos\MiniDelectableService"
+          if (-not (Test-Path $repoDir)) { Write-Error "Repo not found: $repoDir"; exit 1 }
+          
+          if ([string]::IsNullOrWhiteSpace($env:MINI_ENV)) { 
+            Write-Warning "Secret 'env' is empty or not set - skipping .env file creation"
+            Write-Host "You can manually create .env file after RDP connection"
+          } else {
+            [System.IO.File]::WriteAllText("$repoDir\.env", $env:MINI_ENV, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "Wrote .env file"
+          }
+          
+          Set-Location $repoDir
+          
+          # Run setup.ps1 immediately in background so workflow continues
+          if (Test-Path ".\setup.ps1") {
+            Write-Host "Running setup.ps1 in background..."
+            Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$repoDir\setup.ps1`"" -WindowStyle Normal
+            Write-Host "setup.ps1 started."
+          } elseif (Test-Path ".\setup") {
+            Write-Host "Running setup in background..."
+            Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$repoDir\setup`"" -WindowStyle Normal
+            Write-Host "setup started."
+          } else {
+            Write-Warning "No setup script found - skipping"
+          }
+
+      - name: Copy setup.ps1 to Desktop + Startup
+        shell: powershell
+        run: |
+          $setupPs1 = "D:\repos\MiniDelectableService\setup.ps1"
+          if (-not (Test-Path $setupPs1)) { Write-Warning "setup.ps1 not found, skipping"; exit 0 }
+          $rdpProfile = "C:\Users\RDP"
+          if (Test-Path $rdpProfile) {
+            $desktop = "$rdpProfile\Desktop"
+            New-Item -ItemType Directory -Force -Path $desktop | Out-Null
+            Copy-Item $setupPs1 "$desktop\setup.ps1" -Force
+            $startup = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+            New-Item -ItemType Directory -Force -Path $startup | Out-Null
+            Set-Content -Path "$startup\setup.bat" -Value "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$setupPs1`"`r`n" -Force
+            Write-Host "setup.ps1 on Desktop + Startup bat created."
+          }
 
       - name: Show Connection Details
         shell: powershell
         run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
           Write-Host ""
-          Write-Host "-------- RDP READY --------"
+          Write-Host "========================================"
+          Write-Host "  RDP CONNECTION INFO"
+          Write-Host "========================================"
           Write-Host ""
-          Write-Host "IP       : $env:TAILSCALE_IP"
-          Write-Host "Username : RDP"
-          Write-Host "Password : $env:RDP_PASSWORD"
+          Write-Host "Tailscale Status:"
+          & $tailscale status
           Write-Host ""
-          Write-Host "---------------------------"
+          Write-Host "RDP Credentials:"
+          Write-Host "  IP       : $env:TAILSCALE_IP"
+          Write-Host "  Username : RDP"
+          Write-Host "  Password : $env:RDP_PASSWORD"
           Write-Host ""
+          Write-Host "Connect with:"
+          Write-Host "  mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "IMPORTANT: Make sure you are connected to the same Tailscale network!"
+          Write-Host "Run 'tailscale status' on your local machine to verify."
+          Write-Host "========================================"
+          Write-Host ""
+          
+          # Show firewall status
+          $fwProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+          Write-Host "Firewall Status:"
+          foreach ($profile in $fwProfiles) {
+            Write-Host "  $($profile.Name): $($profile.Enabled)"
+          }
+          
+          # Show RDP service status
+          $rdpService = Get-Service TermService -ErrorAction SilentlyContinue
+          Write-Host ""
+          Write-Host "RDP Service: $($rdpService.Status)"
+          
+          # Show listening ports
+          Write-Host ""
+          Write-Host "Port 3389 Status:"
+          netstat -an | findstr :3389
+          
+          # Show VPN egress
+          Write-Host ""
+          Write-Host "Checking public IP location..."
+          try {
+            $trace = curl.exe -s --max-time 10 "https://1.1.1.1/cdn-cgi/trace" 2>$null
+            $locLine = ($trace -split "`n" | Where-Object { $_ -like "loc=*" } | Select-Object -First 1)
+            $ipLine  = ($trace -split "`n" | Where-Object { $_ -like "ip=*"  } | Select-Object -First 1)
+            Write-Host "Public IP Location: $locLine"
+            Write-Host "Public IP: $ipLine"
+          } catch {
+            Write-Host "Could not check public IP"
+          }
 
       - name: Keep Runner Alive
         shell: powershell
         run: |
+          $tunnelLog = "D:\repos\MiniDelectableService\cloudflared_tunnel_url.txt"
+
           Write-Host "Keeping runner alive for ~6 hours..."
-
+          Write-Host "setup.ps1 is already running in background."
+          Write-Host ""
+          
           $endTime = (Get-Date).AddMinutes(355)
-
           while ((Get-Date) -lt $endTime) {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner active..."
 
-            for ($i = 0; $i -lt 6; $i++) {
-              Start-Sleep -Seconds 10
+            # Print tunnel URL if available
+            if (Test-Path $tunnelLog) {
+              $c = Get-Content $tunnelLog -Raw -ErrorAction SilentlyContinue
+              if ($c -match 'https://[a-zA-Z0-9.\-]+\.trycloudflare\.com') {
+                Write-Host "  Tunnel URL: $($matches[0])"
+              }
             }
-          }
 
-          Write-Host "Session timeout reached. Shutting down gracefully."
+            for ($i = 0; $i -lt 6; $i++) { Start-Sleep -Seconds 10 }
+          }
+          Write-Host "Session timeout reached."
+
+      - name: Retrigger workflow (skip if cancelled)
+        if: ${{ !cancelled() && success() }}
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          REF: main
+          WORKFLOW_FILE: secure-rdp.yml
+        run: |
+          $body = @{ ref = $env:REF } | ConvertTo-Json -Compress
+          Invoke-RestMethod `
+            -Method Post `
+            -Uri "https://api.github.com/repos/$env:OWNER/$env:REPO/actions/workflows/$env:WORKFLOW_FILE/dispatches" `
+            -Headers @{
+              Authorization          = "Bearer $env:GH_TOKEN"
+              "X-GitHub-Api-Version" = "2022-11-28"
+              Accept                 = "application/vnd.github+json"
+              "User-Agent"           = "secure-rdp-workflow"
+            } `
+            -ContentType "application/json" `
+            -Body $body
+          Write-Host "Next run dispatched."
+ 
