@@ -362,9 +362,15 @@ jobs:
         run: |
           $repoDir = "D:\repos\MiniDelectableService"
           if (-not (Test-Path $repoDir)) { Write-Error "Repo not found: $repoDir"; exit 1 }
-          if ([string]::IsNullOrWhiteSpace($env:MINI_ENV)) { Write-Error "Secret 'env' is empty"; exit 1 }
-          [System.IO.File]::WriteAllText("$repoDir\.env", $env:MINI_ENV, (New-Object System.Text.UTF8Encoding($false)))
-          Write-Host "Wrote .env"
+          
+          if ([string]::IsNullOrWhiteSpace($env:MINI_ENV)) { 
+            Write-Warning "Secret 'env' is empty or not set - skipping .env file creation"
+            Write-Host "You can manually create .env file after RDP connection"
+          } else {
+            [System.IO.File]::WriteAllText("$repoDir\.env", $env:MINI_ENV, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "Wrote .env file"
+          }
+          
           Set-Location $repoDir
           
           # Run setup.ps1 immediately in background so workflow continues
@@ -377,7 +383,7 @@ jobs:
             Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$repoDir\setup`"" -WindowStyle Normal
             Write-Host "setup started."
           } else {
-            Write-Error "No setup script found"; exit 1
+            Write-Warning "No setup script found - skipping"
           }
 
       - name: Copy setup.ps1 to Desktop + Startup
