@@ -354,61 +354,14 @@ jobs:
           Write-Host "Verifying Tailscale connectivity through WireGuard..."
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
           
-          # Force netcheck to update connectivity
-          Write-Host "Refreshing Tailscale network connectivity..."
-          & $tailscale netcheck
-          
           # Check Tailscale status
           Write-Host ""
           Write-Host "Tailscale status:"
           & $tailscale status
           
-          # Get full Tailscale status with details
           Write-Host ""
-          Write-Host "Detailed Tailscale status:"
-          & $tailscale status --json | ConvertFrom-Json | ConvertTo-Json -Depth 10
-          
-          # Verify we can reach Tailscale coordination servers
-          Write-Host ""
-          Write-Host "Testing Tailscale DERP connectivity..."
-          $netcheck = & $tailscale netcheck 2>&1
-          Write-Host $netcheck
-          
-          # Verify Tailscale IP is still accessible
-          $tsIP = $env:TAILSCALE_IP
-          Write-Host ""
-          Write-Host "Testing local Tailscale IP ($tsIP) reachability..."
-          
-          # Try to connect to ourselves on port 3389
-          $success = $false
-          for ($i = 0; $i -lt 10; $i++) {
-            $test = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
-            if ($test.TcpTestSucceeded) {
-              Write-Host "[OK] Tailscale RDP connectivity verified through VPN (attempt $($i+1))"
-              $success = $true
-              break
-            }
-            Write-Host "Attempt $($i+1)/10 failed, retrying..."
-            Start-Sleep -Seconds 3
-          }
-          
-          if (-not $success) {
-            Write-Warning "Self-test failed, but this is sometimes normal. Checking external connectivity..."
-          }
-          
-          # Show routing table to confirm both routes
-          Write-Host ""
-          Write-Host "Current routing table (Tailscale and VPN routes):"
-          Get-NetRoute | Where-Object { 
-            $_.DestinationPrefix -like "100.*" -or 
-            $_.DestinationPrefix -eq "0.0.0.0/0" -or 
-            $_.DestinationPrefix -like "10.2.*" 
-          } | Format-Table DestinationPrefix, NextHop, InterfaceAlias, RouteMetric -AutoSize
-          
-          # Show all network adapters
-          Write-Host ""
-          Write-Host "Active network adapters:"
-          Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Format-Table Name, InterfaceDescription, MacAddress, LinkSpeed -AutoSize
+          Write-Host "Note: Tailscale may work over relay, but RDP is blocked."
+          Write-Host "We'll use Cloudflare tunnel instead."
 
 
       - name: Verify RDP Port
