@@ -285,7 +285,7 @@ jobs:
             netstat -an | findstr :3389
             exit 1
           }
-          Write-Host "✓ RDP listening locally on port 3389"
+          Write-Host "[OK] RDP listening locally on port 3389"
           
           # Test connection to Tailscale IP
           Write-Host "Testing RDP connectivity via Tailscale ($env:TAILSCALE_IP)..."
